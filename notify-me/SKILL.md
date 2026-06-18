@@ -2,6 +2,12 @@
 name: notify-me
 version: 1.2.0
 description: "Send a Google Chat message to the user and wait for their reply. Use when you need human input, approval, or want to notify the user of progress."
+metadata:
+  requires:
+    bins:
+      - notify-me
+      - jq
+      - curl
 ---
 
 # notify-me
@@ -13,25 +19,25 @@ Send a message to the user via Google Chat and optionally wait for their reply. 
 ### New message + wait for reply
 
 ```bash
-~/.kiro/skills/notify-me/send.sh "Your question here"
+notify-me "Your question here"
 ```
 
 ### Reply in existing thread (fire-and-forget)
 
 ```bash
-~/.kiro/skills/notify-me/send.sh --reply THREAD_NAME "Follow-up message"
+notify-me --reply THREAD_NAME "Follow-up message"
 ```
 
 ### Reply + wait for response
 
 ```bash
-~/.kiro/skills/notify-me/send.sh --reply-wait THREAD_NAME "Question in existing thread"
+notify-me --reply-wait THREAD_NAME "Question in existing thread"
 ```
 
 ### Wait for next reply (no send)
 
 ```bash
-~/.kiro/skills/notify-me/send.sh --wait THREAD_NAME LAST_MESSAGE_ID
+notify-me --wait THREAD_NAME LAST_MESSAGE_ID
 ```
 
 ## Output
@@ -50,12 +56,12 @@ Fire-and-forget `--reply` returns:
 
 ```bash
 # Start conversation
-RESULT=$(~/.kiro/skills/notify-me/send.sh "Build done. Deploy to staging? (yes/no)")
+RESULT=$(notify-me "Build done. Deploy to staging? (yes/no)")
 THREAD=$(echo "$RESULT" | jq -r '.thread')
 REPLY=$(echo "$RESULT" | jq -r '.reply')
 
 # Continue in same thread
-RESULT=$(~/.kiro/skills/notify-me/send.sh --reply-wait "$THREAD" "Deployed. Run tests too?")
+RESULT=$(notify-me --reply-wait "$THREAD" "Deployed. Run tests too?")
 ```
 
 ## Requirements
