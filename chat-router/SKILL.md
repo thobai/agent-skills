@@ -71,20 +71,45 @@ terminal never reaches him.
 
 ## The daemon
 
-One per machine. Install it once — launchd on macOS so it survives reboots,
-tmux elsewhere:
+**If you are an agent: do not install, start, or stop the daemon.** It is
+machine-level infrastructure shared by every session. Check it and report:
+
+```bash
+chat-router daemon status
+```
+
+If `processes` is 0, tell the human the router is down and continue without a
+round trip — do not start one yourself. Several agents each "fixing" the daemon
+is worse than a missing reply.
+
+Setup, for the human, once per machine:
 
 ```bash
 chat-router daemon install          # launchd on macOS, tmux otherwise
 chat-router daemon install --tmux   # force tmux
-chat-router daemon status           # running? how many? where are the logs?
 chat-router daemon uninstall
 tail -f ~/.local/state/chat-router/router.log
 ```
 
-`install` retires the other flavour first, so you cannot end up with two
-supervisors. If the daemon is down, `chat-notify` still delivers the message to
-Chat, but no reply comes back — `daemon status` says so explicitly.
+`install` is idempotent — if that flavour is already running it reports
+`already_running` and changes nothing. Pass `--force` to actually reinstall.
+
+## Troubleshooting
+
+**`chat-router: command not found`** — your shell never sourced the user's rc
+file, so `~/.local/bin` is missing from PATH. This does **not** mean the daemon
+is down. Fix your PATH and check again:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+**`poll error` lines in the log** — usually a transient TLS failure while a VPN
+or proxy is interfering with `chat.googleapis.com`. The daemon keeps running and
+recovers on the next poll; it does not need restarting.
+
+**Your reply never arrived** — check `chat-router list` shows your session as
+live rather than STALE, and that `daemon status` reports a running process.
 
 ## Inspecting and cleaning up
 

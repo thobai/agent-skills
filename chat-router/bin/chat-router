@@ -465,6 +465,14 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         print(json.dumps({"uninstalled": True}))
         return 0
 
+    # Idempotent by default: several agents onboarding at once would otherwise
+    # each tear down a working daemon and start their own.
+    already = launchd_running() if flavour == "launchd" else tmux_running()
+    if already and not args.force:
+        print(json.dumps({"installed": flavour, "already_running": True,
+                          "changed": False}))
+        return 0
+
     # Only one router should supervise a registry, so retire the other flavour.
     stop_launchd()
     stop_tmux()
@@ -577,6 +585,8 @@ def main() -> int:
     d.add_argument("--tmux", dest="flavour", action="store_const", const="tmux",
                    help="supervise with a detached tmux session")
     d.add_argument("--interval", type=int, default=5)
+    d.add_argument("--force", action="store_true",
+                   help="reinstall even if that flavour is already running")
     d.add_argument("--keep-plist", action="store_true", help="uninstall without deleting the plist")
     d.set_defaults(func=cmd_daemon, flavour=None)
 
