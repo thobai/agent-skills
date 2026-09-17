@@ -71,16 +71,20 @@ terminal never reaches him.
 
 ## The daemon
 
-One per machine, already running in a detached tmux session:
+One per machine. Install it once — launchd on macOS so it survives reboots,
+tmux elsewhere:
 
 ```bash
-tmux ls | grep chat-router                    # confirm it is up
-tmux new-session -d -s chat-router 'chat-router watch --interval 5'   # restart
+chat-router daemon install          # launchd on macOS, tmux otherwise
+chat-router daemon install --tmux   # force tmux
+chat-router daemon status           # running? how many? where are the logs?
+chat-router daemon uninstall
 tail -f ~/.local/state/chat-router/router.log
 ```
 
-If the daemon is down, `chat-notify` still delivers the message to Chat, but no
-reply comes back. Check it is running before relying on a round trip.
+`install` retires the other flavour first, so you cannot end up with two
+supervisors. If the daemon is down, `chat-notify` still delivers the message to
+Chat, but no reply comes back — `daemon status` says so explicitly.
 
 ## Inspecting and cleaning up
 
@@ -104,8 +108,11 @@ chat-router unregister --session <id>
 - **Unthreaded messages** (Thomas starts a new Chat message instead of replying)
   go to the most recently active session. Run the daemon with `--fallback none`
   to drop them instead.
-- **Queueing** is handled by kiro-cli: a reply that arrives mid-turn waits for
-  the current turn to finish.
+- **Mid-turn arrival.** A reply that arrives while you are working is surfaced by
+  kiro-cli as live steering, so it can interrupt the current turn rather than
+  waiting for it to end. Act on it in the turn you are in.
+- **Every message is labelled** `[session · repo]`, which is what identifies the
+  asking agent in Chat's thread previews. Pass `--no-label` to suppress it.
 
 ## State
 

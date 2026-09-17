@@ -30,6 +30,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -256,8 +257,15 @@ def cmd_send(args: argparse.Namespace) -> int:
 
     with Registry() as reg:
         entry = reg.data["sessions"].get(session, {})
+        # Thread previews in Chat show only the message text, so the label is
+        # what tells Thomas which agent and repo is asking.
+        text = args.text
+        if not args.no_label:
+            cwd = Path(info.get("cwd") or ".")
+            where = "" if cwd == Path.home() else cwd.name
+            text = f"[{session} · {where}] {text}" if where else f"[{session}] {text}"
         sent = post_webhook(
-            args.text,
+            text,
             thread_key=session,
             thread_name=entry.get("thread") if args.reuse_thread else None,
         )
@@ -353,6 +361,155 @@ def process(msgs: list[dict], args: argparse.Namespace) -> None:
                 log(f"delivered session={session} pane={entry['pane_id']} status={why}")
 
 
+# ------------------------------------------------------- daemon (launchd/tmux)
+
+LAUNCHD_LABEL = "com.thobai.chat-router"
+LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+TMUX_SESSION = "chat-router"
+
+
+def self_path() -> str:
+    return str(Path(__file__).resolve())
+
+
+def daemon_path() -> str:
+    """PATH the daemon needs: this script, herdr, gws, tmux, and system bins."""
+    dirs = [str(Path(self_path()).parent), str(Path.home() / ".local" / "bin")]
+    for tool in ("herdr", "gws", "tmux"):
+        found = shutil.which(tool)
+        if found:
+            dirs.append(str(Path(found).parent))
+    dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return ":".join(out)
+
+
+def sh(cmd: str) -> subprocess.CompletedProcess:
+    """Run cmd in a non-login shell.
+
+    A login shell would source the user's rc files, whose shell-integration
+    escape codes end up in stdout and corrupt parsing.
+    """
+    env = dict(os.environ, PATH=daemon_path())
+    return subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True, env=env)
+
+
+def launchd_running() -> bool:
+    return sh(f"launchctl print gui/$(id -u)/{LAUNCHD_LABEL} >/dev/null 2>&1").returncode == 0
+
+
+def tmux_running() -> bool:
+    return sh(f"tmux has-session -t {TMUX_SESSION} 2>/dev/null").returncode == 0
+
+
+def stop_launchd() -> None:
+    sh(f"launchctl bootout gui/$(id -u)/{LAUNCHD_LABEL} 2>/dev/null || "
+       f"launchctl unload -w '{LAUNCHD_PLIST}' 2>/dev/null")
+
+
+def stop_tmux() -> None:
+    sh(f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null")
+
+
+def write_plist(interval: int) -> None:
+    LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{self_path()}</string>
+    <string>watch</string>
+    <string>--interval</string>
+    <string>{interval}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>{daemon_path()}</string>
+    <key>HOME</key><string>{Path.home()}</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>{STATE_DIR / 'launchd.out'}</string>
+  <key>StandardErrorPath</key><string>{STATE_DIR / 'launchd.err'}</string>
+</dict>
+</plist>
+"""
+    LAUNCHD_PLIST.write_text(plist)
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    if args.action == "status":
+        return daemon_status()
+
+    flavour = args.flavour
+    if flavour is None:
+        flavour = "launchd" if sys.platform == "darwin" else "tmux"
+    if flavour == "launchd" and sys.platform != "darwin":
+        die("launchd is macOS only; use --tmux")
+
+    if args.action == "uninstall":
+        stop_launchd()
+        stop_tmux()
+        if LAUNCHD_PLIST.exists() and not args.keep_plist:
+            LAUNCHD_PLIST.unlink()
+        print(json.dumps({"uninstalled": True}))
+        return 0
+
+    # Only one router should supervise a registry, so retire the other flavour.
+    stop_launchd()
+    stop_tmux()
+
+    if flavour == "launchd":
+        write_plist(args.interval)
+        r = sh(f"launchctl bootstrap gui/$(id -u) '{LAUNCHD_PLIST}' 2>&1 || "
+               f"launchctl load -w '{LAUNCHD_PLIST}' 2>&1")
+        time.sleep(2)
+        if not launchd_running():
+            die(f"launchd did not start: {(r.stdout + r.stderr).strip()[:200]}")
+        print(json.dumps({"installed": "launchd", "label": LAUNCHD_LABEL,
+                          "plist": str(LAUNCHD_PLIST), "survives_reboot": True}))
+    else:
+        if not sh("command -v tmux").stdout.strip():
+            die("tmux not found")
+        sh(f"tmux new-session -d -s {TMUX_SESSION} "
+           f"'export PATH=\"{daemon_path()}\"; {self_path()} watch --interval {args.interval}'")
+        time.sleep(2)
+        if not tmux_running():
+            die("tmux session did not start")
+        print(json.dumps({"installed": "tmux", "session": TMUX_SESSION,
+                          "survives_reboot": False}))
+    return 0
+
+
+def daemon_status() -> int:
+    raw = sh("pgrep -f 'chat-router watch' || true").stdout
+    procs = len([ln for ln in raw.splitlines() if ln.strip().isdigit()])
+    out = {
+        "launchd": launchd_running(),
+        "tmux": tmux_running(),
+        "processes": procs,
+        "plist": str(LAUNCHD_PLIST) if LAUNCHD_PLIST.exists() else None,
+        "log": str(LOGFILE),
+    }
+    if out["processes"] == 0:
+        out["warning"] = "no router running: messages will send but no replies come back"
+    elif out["processes"] > 1:
+        out["warning"] = (f"{out['processes']} routers running; duplicate delivery is "
+                          "prevented by the registry lock but only one is needed")
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     data = read_registry()
     if args.json:
@@ -399,6 +556,8 @@ def main() -> int:
     s.add_argument("--name", help="rename the Herdr agent to this (default: session id)")
     s.add_argument("--reuse-thread", action="store_true",
                    help="reply into the recorded thread name instead of the session thread key")
+    s.add_argument("--no-label", action="store_true",
+                   help="omit the [session · repo] prefix")
     s.set_defaults(func=cmd_send)
 
     w = sub.add_parser("watch", help="run the router daemon")
@@ -410,6 +569,16 @@ def main() -> int:
     w.add_argument("--quiet-stale", action="store_true",
                    help="do not post a Chat note when a target is gone")
     w.set_defaults(func=cmd_watch)
+
+    d = sub.add_parser("daemon", help="install/inspect the router daemon (launchd or tmux)")
+    d.add_argument("action", choices=["install", "status", "uninstall"])
+    d.add_argument("--launchd", dest="flavour", action="store_const", const="launchd",
+                   help="supervise with launchd (macOS, survives reboot)")
+    d.add_argument("--tmux", dest="flavour", action="store_const", const="tmux",
+                   help="supervise with a detached tmux session")
+    d.add_argument("--interval", type=int, default=5)
+    d.add_argument("--keep-plist", action="store_true", help="uninstall without deleting the plist")
+    d.set_defaults(func=cmd_daemon, flavour=None)
 
     l = sub.add_parser("list", help="show registered sessions")
     l.add_argument("--json", action="store_true")
