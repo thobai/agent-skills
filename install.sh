@@ -4,6 +4,8 @@ set -e
 # Symlink skill binaries to ~/.local/bin
 mkdir -p ~/.local/bin
 for skill in */bin/*; do
+  [ -f "$skill" ] || continue
+  case "$(basename "$skill")" in __pycache__|*.pyc) continue ;; esac
   ln -sf "$(pwd)/$skill" ~/.local/bin/$(basename "$skill")
   echo "  ✓ $(basename "$skill") → ~/.local/bin/$(basename "$skill")"
 done

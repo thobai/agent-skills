@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Route Google Chat replies into running Herdr agent panes.
+
+Instead of each agent blocking on a poll loop, sessions register themselves
+(``chat-router send``) and one long-lived router (``chat-router watch``) turns
+every human Chat message into a prompt for the right agent pane.
+
+  chat-router send --session <id> "text"   fire-and-forget notify + register
+  chat-router watch                        the daemon (one per machine)
+  chat-router list                         show the registry
+  chat-router unregister --session <id>    drop one entry (or --stale for all dead)
+
+Routing is by Chat thread: each session owns one thread, keyed by session id.
+A human message in that thread is injected into that session's pane. Messages
+posted by the webhook are BOT-sent and always ignored, so the router cannot
+feed an agent its own output.
+
+Stale targets: the pane id plus the terminal id recorded at registration must
+both still be live. Herdr does not reuse closed pane ids, but a pane whose
+agent exits and is replaced keeps its id, so the terminal id is what actually
+proves the registered session is still the pane's occupant.
+
+Exit codes: 0 normal, 2 configuration or gws failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(
+    os.environ.get("CHAT_ROUTER_STATE_DIR", Path.home() / ".local" / "state" / "chat-router")
+)
+REGISTRY = STATE_DIR / "registry.json"
+LOCK = STATE_DIR / "registry.lock"
+LOGFILE = STATE_DIR / "router.log"
+
+SEEN_CAP = 300  # message ids retained for dedup
+INJECT_CAP = 1800  # characters of chat text passed to the agent
+ENV_FILE = Path(
+    os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+) / "agent-skills" / "env"
+
+
+# ---------------------------------------------------------------- configuration
+
+
+def load_env() -> None:
+    """Populate NOTIFY_ME_* from the agent-skills env file if not already set.
+
+    Agents run with a non-interactive shell that never sourced ~/.zshrc, so the
+    config file is the reliable source.
+    """
+    if not ENV_FILE.exists():
+        return
+    for line in ENV_FILE.read_text().splitlines():
+        m = re.match(r'\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$', line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val[:1] in "\"'" and val[-1:] == val[:1]:
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+
+def require(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        die(f"{name} is not set (expected in {ENV_FILE})")
+    return val
+
+
+def die(msg: str) -> None:
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(2)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def log(msg: str) -> None:
+    line = f"{now_iso()} {msg}"
+    print(line, flush=True)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with LOGFILE.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+# -------------------------------------------------------------------- registry
+
+
+class Registry:
+    """JSON registry guarded by an flock, so send and watch can both write."""
+
+    def __init__(self) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._fh = LOCK.open("w")
+        self.data: dict = {}
+
+    def __enter__(self) -> "Registry":
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        try:
+            self.data = json.loads(REGISTRY.read_text())
+        except (OSError, json.JSONDecodeError):
+            self.data = {}
+        self.data.setdefault("sessions", {})
+        self.data.setdefault("seen", [])
+        self.data.setdefault("watermark", None)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        try:
+            if exc[0] is None:
+                self.data["seen"] = self.data["seen"][-SEEN_CAP:]
+                tmp = REGISTRY.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self.data, indent=2))
+                tmp.replace(REGISTRY)
+        finally:
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
+            self._fh.close()
+
+
+def read_registry() -> dict:
+    try:
+        return json.loads(REGISTRY.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"sessions": {}, "seen": [], "watermark": None}
+
+
+# ------------------------------------------------------------------------ gws
+
+
+def gws_json(args: list[str]) -> dict:
+    """Run gws and parse its JSON, skipping the keyring preamble."""
+    p = subprocess.run(["gws", *args], capture_output=True, text=True)
+    lines = p.stdout.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln[:1] in "{["), None)
+    if start is None:
+        return {"error": {"message": (p.stderr or p.stdout or "no output").strip()[:300]}}
+    try:
+        return json.loads("\n".join(lines[start:]))
+    except json.JSONDecodeError as e:
+        return {"error": {"message": f"unparseable gws response: {e}"}}
+
+
+def fetch_recent(space: str, limit: int) -> tuple[list[dict], str | None]:
+    """Newest-first page of space messages."""
+    params = json.dumps({"parent": space, "pageSize": limit, "orderBy": "createTime desc"})
+    d = gws_json(["chat", "spaces", "messages", "list", "--params", params])
+    if "error" in d:
+        return [], json.dumps(d["error"])[:300]
+    return d.get("messages") or [], None
+
+
+def post_webhook(text: str, *, thread_key: str | None = None,
+                 thread_name: str | None = None) -> dict:
+    """Post to the space webhook. thread_key binds a session to one thread."""
+    url = require("NOTIFY_ME_WEBHOOK_URL")
+    body: dict = {"text": text}
+    if thread_name:
+        body["thread"] = {"name": thread_name}
+    elif thread_key:
+        body["thread"] = {"threadKey": thread_key}
+    if "thread" in body:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return {"error": f"webhook HTTP {e.code}: {e.read().decode()[:200]}"}
+    except (urllib.error.URLError, TimeoutError) as e:
+        return {"error": f"webhook unreachable: {e}"}
+
+
+# ---------------------------------------------------------------------- herdr
+
+
+def herdr(args: list[str]) -> dict:
+    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    try:
+        return json.loads(p.stdout or p.stderr or "{}")
+    except json.JSONDecodeError:
+        return {"error": {"message": (p.stderr or p.stdout).strip()[:300]}}
+
+
+def agent_info(target: str) -> dict | None:
+    d = herdr(["agent", "get", target])
+    return (d.get("result") or {}).get("agent")
+
+
+def target_alive(entry: dict) -> tuple[bool, str]:
+    """A target is alive only if the pane still hosts the same terminal."""
+    info = agent_info(entry["pane_id"])
+    if not info:
+        return False, "no agent in pane"
+    if info.get("terminal_id") != entry.get("terminal_id"):
+        return False, (
+            f"terminal changed ({entry.get('terminal_id')} -> {info.get('terminal_id')})"
+        )
+    return True, info.get("agent_status", "unknown")
+
+
+def flatten(text: str) -> str:
+    """Collapse whitespace: a newline in an injected prompt submits it early."""
+    return re.sub(r"\s+", " ", (text or "").strip())[:INJECT_CAP]
+
+
+def inject(entry: dict, session: str, text: str) -> bool:
+    prompt = (
+        f"[chat-router] Thomas replied in Google Chat (session {session}): {flatten(text)} "
+        f"-- reply with: chat-notify --session {session} \"<your answer>\""
+    )
+    d = herdr(["agent", "prompt", entry["pane_id"], prompt])
+    if "error" in d:
+        log(f"inject FAILED session={session} pane={entry['pane_id']} err={d['error']}")
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ subcommands
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    space = require("NOTIFY_ME_SPACE_ID")
+    session = args.session
+    pane = args.pane or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        die("no target pane: run inside Herdr or pass --pane")
+
+    info = agent_info(pane)
+    if not info:
+        die(f"no agent found in pane {pane}")
+
+    if args.name or not info.get("name"):
+        herdr(["agent", "rename", pane, args.name or session])
+        info = agent_info(pane) or info
+
+    with Registry() as reg:
+        entry = reg.data["sessions"].get(session, {})
+        sent = post_webhook(
+            args.text,
+            thread_key=session,
+            thread_name=entry.get("thread") if args.reuse_thread else None,
+        )
+        if "error" in sent:
+            die(sent["error"])
+        thread = (sent.get("thread") or {}).get("name")
+        reg.data["sessions"][session] = {
+            "thread": thread,
+            "pane_id": pane,
+            "terminal_id": info.get("terminal_id"),
+            "agent_name": info.get("name"),
+            "agent_kind": info.get("agent"),
+            "cwd": info.get("cwd"),
+            "registered_at": entry.get("registered_at") or now_iso(),
+            "last_sent_at": now_iso(),
+        }
+        # A registration in the past must not make the router replay history.
+        if reg.data.get("watermark") is None:
+            reg.data["watermark"] = now_iso()
+
+    out = {
+        "session": session,
+        "thread": thread,
+        "message_id": sent.get("name"),
+        "target": pane,
+        "agent_name": info.get("name"),
+        "routed": True,
+    }
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    space = require("NOTIFY_ME_SPACE_ID")
+    require("NOTIFY_ME_WEBHOOK_URL")
+    log(f"router start space={space} interval={args.interval}s fallback={args.fallback}")
+
+    while True:
+        msgs, err = fetch_recent(space, args.page_size)
+        if err:
+            log(f"poll error: {err}")
+        else:
+            process(list(reversed(msgs)), args)  # oldest-first
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+def process(msgs: list[dict], args: argparse.Namespace) -> None:
+    with Registry() as reg:
+        sessions = reg.data["sessions"]
+        seen = set(reg.data["seen"])
+        watermark = reg.data["watermark"] or now_iso()
+        reg.data["watermark"] = watermark
+
+        for m in msgs:
+            mid, created = m.get("name"), m.get("createTime") or ""
+            if not mid or mid in seen:
+                continue
+            if created <= watermark:
+                continue
+            if (m.get("sender") or {}).get("type") != "HUMAN":
+                reg.data["watermark"] = max(reg.data["watermark"], created)
+                continue
+
+            thread = (m.get("thread") or {}).get("name")
+            session = next((s for s, e in sessions.items() if e.get("thread") == thread), None)
+            if session is None and args.fallback == "last" and sessions:
+                session = max(sessions, key=lambda s: sessions[s].get("last_sent_at") or "")
+                log(f"unthreaded msg -> fallback session={session}")
+
+            reg.data["seen"].append(mid)
+            reg.data["watermark"] = max(reg.data["watermark"], created)
+
+            if session is None:
+                log(f"no route for msg={mid.split('/')[-1]} thread={thread}")
+                continue
+
+            entry = sessions[session]
+            alive, why = target_alive(entry)
+            if not alive:
+                log(f"stale target session={session} pane={entry['pane_id']} ({why}) - dropping")
+                del sessions[session]
+                if entry.get("thread") and not args.quiet_stale:
+                    post_webhook(
+                        f"Session `{session}` is no longer running ({why}). "
+                        f"Message not delivered.",
+                        thread_name=entry["thread"],
+                    )
+                continue
+
+            if inject(entry, session, m.get("text") or ""):
+                log(f"delivered session={session} pane={entry['pane_id']} status={why}")
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    data = read_registry()
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    sessions = data.get("sessions") or {}
+    if not sessions:
+        print("no registered sessions")
+        return 0
+    print(f"{'SESSION':<24} {'PANE':<10} {'STATE':<10} THREAD")
+    for s, e in sorted(sessions.items(), key=lambda kv: kv[1].get("last_sent_at") or ""):
+        alive, why = target_alive(e)
+        print(f"{s:<24} {e.get('pane_id',''):<10} {(why if alive else 'STALE'):<10} "
+              f"{(e.get('thread') or '').split('/')[-1]}")
+    print(f"\nwatermark: {data.get('watermark')}")
+    return 0
+
+
+def cmd_unregister(args: argparse.Namespace) -> int:
+    with Registry() as reg:
+        sessions = reg.data["sessions"]
+        if args.stale:
+            dropped = [s for s, e in list(sessions.items()) if not target_alive(e)[0]]
+            for s in dropped:
+                del sessions[s]
+            print(json.dumps({"dropped": dropped}))
+        elif args.session:
+            existed = sessions.pop(args.session, None) is not None
+            print(json.dumps({"dropped": [args.session] if existed else []}))
+        else:
+            die("pass --session <id> or --stale")
+    return 0
+
+
+def main() -> int:
+    load_env()
+    ap = argparse.ArgumentParser(prog="chat-router", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="notify Thomas and register this pane for replies")
+    s.add_argument("text")
+    s.add_argument("--session", required=True, help="stable session id; owns one Chat thread")
+    s.add_argument("--pane", help="target pane id (default: $HERDR_PANE_ID)")
+    s.add_argument("--name", help="rename the Herdr agent to this (default: session id)")
+    s.add_argument("--reuse-thread", action="store_true",
+                   help="reply into the recorded thread name instead of the session thread key")
+    s.set_defaults(func=cmd_send)
+
+    w = sub.add_parser("watch", help="run the router daemon")
+    w.add_argument("--interval", type=int, default=5)
+    w.add_argument("--page-size", type=int, default=25)
+    w.add_argument("--once", action="store_true")
+    w.add_argument("--fallback", choices=["last", "none"], default="last",
+                   help="where to route messages outside any known thread")
+    w.add_argument("--quiet-stale", action="store_true",
+                   help="do not post a Chat note when a target is gone")
+    w.set_defaults(func=cmd_watch)
+
+    l = sub.add_parser("list", help="show registered sessions")
+    l.add_argument("--json", action="store_true")
+    l.set_defaults(func=cmd_list)
+
+    u = sub.add_parser("unregister", help="drop registry entries")
+    u.add_argument("--session")
+    u.add_argument("--stale", action="store_true")
+    u.set_defaults(func=cmd_unregister)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("router stopped")
+        sys.exit(0)

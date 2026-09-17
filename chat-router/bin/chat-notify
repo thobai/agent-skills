@@ -1,0 +1,43 @@
+#!/bin/bash
+# chat-notify — fire-and-forget message to Thomas in Google Chat.
+#
+# Unlike notify-me, this never blocks: the reply comes back as a new prompt,
+# injected into this pane by the chat-router daemon. Send, say what decision is
+# parked, then end your turn.
+#
+#   chat-notify --session apm-123 "Batch or stream? (A/B)"
+#   chat-notify "quick note"            # session defaults to the Herdr agent
+#                                       # name, else the pane id
+#
+# Requires: chat-router on PATH, a Herdr pane ($HERDR_PANE_ID), and a running
+# `chat-router watch` daemon for replies to be delivered.
+set -euo pipefail
+
+SESSION=""
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session) SESSION="$2"; shift 2 ;;
+    --session=*) SESSION="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#ARGS[@]}" -eq 0 ]; then
+  echo "usage: chat-notify [--session ID] \"message\"" >&2
+  exit 2
+fi
+
+if [ -z "$SESSION" ]; then
+  if [ -n "${HERDR_PANE_ID:-}" ]; then
+    SESSION=$(herdr agent get "$HERDR_PANE_ID" 2>/dev/null \
+      | jq -r '.result.agent.name // empty' || true)
+    [ -z "$SESSION" ] && SESSION="pane-$(echo "$HERDR_PANE_ID" | tr ':' '-')"
+  else
+    echo "chat-notify: no --session and no \$HERDR_PANE_ID" >&2
+    exit 2
+  fi
+fi
+
+exec chat-router send --session "$SESSION" "${ARGS[@]}"

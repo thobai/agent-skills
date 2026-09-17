@@ -34,6 +34,7 @@ export NOTIFY_ME_WEBHOOK_URL="https://chat.googleapis.com/v1/spaces/YOUR_SPACE/m
 | Skill | Binary | Description |
 |-------|--------|-------------|
 | [notify-me](./notify-me/) | `notify-me` | Send a Google Chat message and wait for reply |
+| [chat-router](./chat-router/) | `chat-notify`, `chat-router` | Send a Google Chat message without blocking; replies are injected back into the agent's Herdr pane |
 
 ## Adding to your agent
 
