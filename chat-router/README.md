@@ -51,8 +51,11 @@ tail -f ~/.local/state/chat-router/router.log
   the message vanishing.
 - **Whitespace is collapsed** in injected text: a newline in a prompt submits it
   early and would fragment the reply.
-- **Unthreaded messages** — Thomas starting a new message instead of replying —
-  go to the most recently active session. `--fallback none` drops them instead.
+- **Unmatched threads.** A message in a thread no session owns — a retired
+  session's thread, or a brand new message — is not delivered. The router replies
+  in that thread naming the live sessions. Guessing the target sends a message to
+  the wrong agent, which is worse than not delivering it. `--fallback last`
+  restores the old guessing behaviour.
 - **Markdown** is sent with `markupSyntax: MARKUP_SYNTAX_MARKDOWN`. Tables are
   wrapped in a code fence first, because Chat concatenates their cells and eats
   the following line; `---` rules are stripped, because Chat discards them.

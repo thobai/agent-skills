@@ -389,13 +389,24 @@ def process(msgs: list[dict], args: argparse.Namespace) -> None:
             session = next((s for s, e in sessions.items() if e.get("thread") == thread), None)
             if session is None and args.fallback == "last" and sessions:
                 session = max(sessions, key=lambda s: sessions[s].get("last_sent_at") or "")
-                log(f"unthreaded msg -> fallback session={session}")
+                log(f"no session for thread {thread} -> fallback session={session}")
 
             reg.data["seen"].append(mid)
             reg.data["watermark"] = max(reg.data["watermark"], created)
 
             if session is None:
                 log(f"no route for msg={mid.split('/')[-1]} thread={thread}")
+                # Guessing a target delivers a message to the wrong agent, which
+                # is worse than not delivering it. Say so in the thread instead.
+                if thread:
+                    live = ", ".join(f"`{s}`" for s in sorted(sessions)) or "none"
+                    note = post_webhook(
+                        "**Not delivered** — no agent is registered for this thread. "
+                        f"Live sessions: {live}. Reply in one of their threads.",
+                        thread_name=thread,
+                    )
+                    if "error" in note:
+                        log(f"could not post not-delivered note: {note['error']}")
                 continue
 
             entry = sessions[session]
@@ -626,8 +637,9 @@ def main() -> int:
     w.add_argument("--interval", type=int, default=5)
     w.add_argument("--page-size", type=int, default=25)
     w.add_argument("--once", action="store_true")
-    w.add_argument("--fallback", choices=["last", "none"], default="last",
-                   help="where to route messages outside any known thread")
+    w.add_argument("--fallback", choices=["last", "none"], default="none",
+                   help="'last' routes a message from an unknown thread to the most "
+                        "recently active session; the default refuses and says so in Chat")
     w.add_argument("--quiet-stale", action="store_true",
                    help="do not post a Chat note when a target is gone")
     w.set_defaults(func=cmd_watch)

@@ -26,8 +26,9 @@ Write Markdown; it renders. Tables and `---` are fixed up for you, and every
 heading level renders the same, as bold.
 
 Send only when the answer is not in the code, the steering files or an approved
-plan. Be decidable ("A or B, here is the trade-off"), say what you already
-tried, and keep it to four lines — he is reading on a phone.
+plan. Be decidable ("A or B, here is the trade-off") and keep it to four lines —
+he is reading on a phone. No history, no recap of what you have done, no
+explanation he did not ask for: the decision and what it hinges on, nothing else.
 
 Needs a Herdr pane; outside Herdr use `notify-me`. If `chat-notify` is not
 found, `export PATH="$HOME/.local/bin:$PATH"` — that is a PATH problem, not a
