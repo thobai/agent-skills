@@ -61,6 +61,33 @@ chat-notify --session <session-id> "Done — MR !5968 is up."
 He is reading Chat, not your terminal, so an answer that only appears in the
 terminal never reaches him.
 
+## Formatting
+
+Write normal Markdown. Messages are sent with `markupSyntax:
+MARKUP_SYNTAX_MARKDOWN`, so Chat renders it:
+
+| You write | Chat shows |
+|---|---|
+| `**bold**`, `_italic_`, `~~strike~~` | bold, italic, strikethrough |
+| `` `code` `` and ```` ``` ```` fences | monospace, monospace block |
+| `## Heading` | a bold line (all heading levels look the same) |
+| `- item` / `1. item`, nested by two spaces | bulleted and numbered lists |
+| `> quoted` | quote with a vertical bar |
+| `[label](https://url)` | a labelled link |
+
+Two exceptions, both handled for you:
+
+- **Tables** are wrapped in a code fence before sending. Chat's own renderer
+  concatenates cells into one run of text and swallows the line after the
+  table, so an unfenced table loses information.
+- **Horizontal rules** (`---`) are stripped. Chat drops them silently.
+
+Not available: headings of distinct sizes, coloured text, images, and @mentions
+of other people. Use `--no-label` if you need the message to start with your own
+text rather than the `[session · repo]` prefix.
+
+Keep it short regardless of what renders — four lines on a phone.
+
 ## Message rules
 
 - Be decidable: "A or B, here's the trade-off", not "what should I do?"

@@ -172,7 +172,9 @@ def post_webhook(text: str, *, thread_key: str | None = None,
                  thread_name: str | None = None) -> dict:
     """Post to the space webhook. thread_key binds a session to one thread."""
     url = require("NOTIFY_ME_WEBHOOK_URL")
-    body: dict = {"text": text}
+    # Chat parses standard Markdown only when asked; the default Chat syntax
+    # would render **bold** and [label](url) literally.
+    body: dict = {"text": text, "markupSyntax": "MARKUP_SYNTAX_MARKDOWN"}
     if thread_name:
         body["thread"] = {"name": thread_name}
     elif thread_key:
@@ -190,6 +192,55 @@ def post_webhook(text: str, *, thread_key: str | None = None,
         return {"error": f"webhook HTTP {e.code}: {e.read().decode()[:200]}"}
     except (urllib.error.URLError, TimeoutError) as e:
         return {"error": f"webhook unreachable: {e}"}
+
+
+TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
+
+
+def to_chat_markdown(text: str) -> str:
+    """Make agent Markdown safe for Chat's Markdown renderer.
+
+    Chat handles headings, bold, italic, strikethrough, inline code, fenced
+    code, bullets, nested bullets, numbered lists, block quotes and links.
+    Two things it does not handle:
+
+    - Tables are destructive: cells are concatenated without separators and
+      the following line can be swallowed. Wrapping a table in a code fence
+      keeps it aligned and readable instead.
+    - Horizontal rules vanish silently, so drop them rather than let an agent
+      believe a separator was delivered.
+    """
+    lines = (text or "").split("\n")
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+        # A table is a pipe row followed by a dashed separator row.
+        if (line.lstrip().startswith("|") and i + 1 < len(lines)
+                and TABLE_SEP.match(lines[i + 1]) and "|" in lines[i + 1]):
+            block = []
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                block.append(lines[i].rstrip())
+                i += 1
+            out += ["```", *block, "```"]
+            continue
+        if re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line):  # horizontal rule
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    # Dropping a rule leaves a blank line on each side of where it was.
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
 # ---------------------------------------------------------------------- herdr
@@ -259,11 +310,15 @@ def cmd_send(args: argparse.Namespace) -> int:
         entry = reg.data["sessions"].get(session, {})
         # Thread previews in Chat show only the message text, so the label is
         # what tells Thomas which agent and repo is asking.
-        text = args.text
+        text = to_chat_markdown(args.text)
         if not args.no_label:
             cwd = Path(info.get("cwd") or ".")
             where = "" if cwd == Path.home() else cwd.name
-            text = f"[{session} · {where}] {text}" if where else f"[{session}] {text}"
+            label = f"**[{session} · {where}]**" if where else f"**[{session}]**"
+            # Keep a multi-line message's first line free for the label so the
+            # thread preview shows who is asking.
+            sep = "\n" if "\n" in text else " "
+            text = f"{label}{sep}{text}"
         sent = post_webhook(
             text,
             thread_key=session,
