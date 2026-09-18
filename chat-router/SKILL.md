@@ -16,11 +16,8 @@ chat-notify --session apm-123 "Batch or stream? (A/B) Batch is ~2h and reuses th
 ```
 
 Returns immediately. `"routed": true` means his reply will come back to you as a
-prompt starting `[chat-router] Thomas replied` — possibly mid-turn. Never poll,
-and do not use `notify-me`, which blocks your turn until he answers.
-
-After sending, say which decision is parked and stop. Do not start work the
-answer could invalidate.
+prompt starting `[chat:<session>]` — possibly mid-turn. Never poll, and do not
+use `notify-me`, which blocks your turn until he answers.
 
 `--session` is a ticket, branch or task name and owns one Chat thread. Reuse the
 same id to answer him there — he reads Chat, not your terminal.

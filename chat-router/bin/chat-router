@@ -277,10 +277,9 @@ def flatten(text: str) -> str:
 
 
 def inject(entry: dict, session: str, text: str) -> bool:
-    prompt = (
-        f"[chat-router] Thomas replied in Google Chat (session {session}): {flatten(text)} "
-        f"-- reply with: chat-notify --session {session} \"<your answer>\""
-    )
+    # Terse on purpose: this prefix is prepended to every reply an agent reads,
+    # so boilerplate here is a recurring token and attention cost.
+    prompt = f"[chat:{session}] {flatten(text)}"
     d = herdr(["agent", "prompt", entry["pane_id"], prompt])
     if "error" in d:
         log(f"inject FAILED session={session} pane={entry['pane_id']} err={d['error']}")
