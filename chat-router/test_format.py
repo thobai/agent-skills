@@ -47,6 +47,28 @@ def main() -> int:
             failures += 1
             print(f"FAIL\n  in:   {src!r}\n  want: {want!r}\n  got:  {got!r}")
     total = len(CASES)
+
+    r = mod.resolve_name
+    live = {"orchestrator": {}, "chat-router-test": {}, "e2e-solo-a": {}}
+    NAME_CASES = [
+        ("orchestrator", ("orchestrator", "")),
+        ("Orchestrator.", ("orchestrator", "")),
+        ("orch", ("orchestrator", "")),
+        ("send to orchestrator: ship it", ("orchestrator", "send to : ship it")),
+        ("chat-router-test", ("chat-router-test", "")),
+        # Ambiguous or unknown must not guess.
+        ("e2", (None, "")),
+        ("nobody", (None, "")),
+        ("", (None, "")),
+        ("yes", (None, "")),
+    ]
+    for src, want in NAME_CASES:
+        got = r(src, live)
+        if got != want:
+            failures += 1
+            print(f"FAIL resolve_name\n  in:   {src!r}\n  want: {want!r}\n  got:  {got!r}")
+    total += len(NAME_CASES)
+
     print(f"{total - failures}/{total} passed")
     return 1 if failures else 0
 

@@ -121,6 +121,7 @@ class Registry:
             self.data = {}
         self.data.setdefault("sessions", {})
         self.data.setdefault("seen", [])
+        self.data.setdefault("pending", {})
         self.data.setdefault("watermark", None)
         return self
 
@@ -243,6 +244,46 @@ def to_chat_markdown(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
+# -------------------------------------------------------------- name matching
+
+
+def recent_sessions(sessions: dict, limit: int = 5) -> list[str]:
+    return sorted(sessions, key=lambda s: sessions[s].get("last_sent_at") or "",
+                  reverse=True)[:limit]
+
+
+def resolve_name(text: str, sessions: dict) -> tuple[str | None, str]:
+    """Match a reply like 'orchestrator' or 'send to orch' to one live session.
+
+    Returns (session, remaining_text); the remainder is content he wrote
+    alongside the name. Unmatched or ambiguous gives (None, '').
+    """
+    raw = (text or "").strip()
+    t = raw.lower()
+    if not t or not sessions:
+        return None, ""
+
+    exact = [s for s in sessions if s.lower() == t.strip("`\"'.,:;!? ")]
+    contained = [s for s in sessions if s.lower() in t]
+    tokens = [w.strip("`\"'.,:;!?") for w in t.split()]
+    # Allow an unambiguous abbreviation: 'orch' for 'orchestrator'.
+    prefixed = [s for s in sessions
+                if any(len(w) >= 3 and s.lower().startswith(w) for w in tokens)]
+
+    found = exact if len(exact) == 1 else (contained or prefixed)
+    if len(found) != 1:
+        return None, ""
+    session = found[0]
+    # Remove whatever named the session — the full name or the abbreviation he
+    # used — so the remainder is only content meant for the agent.
+    used = [session] + [w for w in tokens
+                        if len(w) >= 3 and session.lower().startswith(w)]
+    remainder = raw
+    for word in sorted(used, key=len, reverse=True):
+        remainder = re.sub(re.escape(word), "", remainder, flags=re.I)
+    return session, remainder.strip(" `\"'.,:;!?-\n")
+
+
 # ---------------------------------------------------------------------- herdr
 
 
@@ -321,7 +362,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         sent = post_webhook(
             text,
             thread_key=session,
-            thread_name=entry.get("thread") if args.reuse_thread else None,
+            # An adopted thread replaces the session's own, so both directions
+            # of the conversation stay in the thread Thomas is reading.
+            thread_name=entry.get("thread"),
         )
         if "error" in sent:
             die(sent["error"])
@@ -395,18 +438,7 @@ def process(msgs: list[dict], args: argparse.Namespace) -> None:
             reg.data["watermark"] = max(reg.data["watermark"], created)
 
             if session is None:
-                log(f"no route for msg={mid.split('/')[-1]} thread={thread}")
-                # Guessing a target delivers a message to the wrong agent, which
-                # is worse than not delivering it. Say so in the thread instead.
-                if thread:
-                    live = ", ".join(f"`{s}`" for s in sorted(sessions)) or "none"
-                    note = post_webhook(
-                        "**Not delivered** — no agent is registered for this thread. "
-                        f"Live sessions: {live}. Reply in one of their threads.",
-                        thread_name=thread,
-                    )
-                    if "error" in note:
-                        log(f"could not post not-delivered note: {note['error']}")
+                handle_unmatched(reg, sessions, thread, m.get("text") or "", mid)
                 continue
 
             entry = sessions[session]
@@ -583,6 +615,67 @@ def daemon_status() -> int:
     return 0
 
 
+def handle_unmatched(reg, sessions: dict, thread: str | None, text: str, mid: str) -> None:
+    """No session owns this thread.
+
+    First message: hold it and ask who it is for. Next message: if it names a
+    live session, bind this thread to that session and forward everything held.
+    Guessing a target instead would hand one agent another's instructions.
+    """
+    pending = reg.data.setdefault("pending", {})
+    if not thread:
+        log(f"no route for msg={mid.split('/')[-1]} (no thread)")
+        return
+
+    held = pending.get(thread)
+    if held:
+        session, remainder = resolve_name(text, sessions)
+        if session:
+            entry = sessions[session]
+            alive, why = target_alive(entry)
+            if not alive:
+                del sessions[session]
+                post_webhook(f"`{session}` is no longer running ({why}). "
+                             f"Still holding your message.", thread_name=thread)
+                return
+            # This thread becomes the session's inbox and outbox from now on.
+            entry["thread"] = thread
+            forwarded = " — ".join([*held["texts"], remainder] if remainder else held["texts"])
+            if inject(entry, session, forwarded):
+                del pending[thread]
+                log(f"adopted thread={thread.split('/')[-1]} session={session}")
+                post_webhook(f"Routed to `{session}`. This thread reaches it from now on.",
+                             thread_name=thread)
+            return
+        held["texts"].append(text)
+        ask_who(sessions, thread, held=len(held["texts"]))
+        return
+
+    pending[thread] = {"texts": [text], "asked_at": now_iso()}
+    # Keep the pending map from growing without bound.
+    for old in list(pending)[:-20]:
+        del pending[old]
+    log(f"no route for msg={mid.split('/')[-1]} thread={thread} - holding")
+    ask_who(sessions, thread, held=1)
+
+
+def ask_who(sessions: dict, thread: str, held: int) -> None:
+    names = recent_sessions(sessions)
+    if not names:
+        post_webhook("**Not delivered** — no agents are registered right now.",
+                     thread_name=thread)
+        return
+    listed = ", ".join(f"`{s}`" for s in names)
+    plural = "message" if held == 1 else f"{held} messages"
+    note = post_webhook(
+        f"**Not delivered** — no agent owns this thread. Holding your {plural}. "
+        f"Reply with a name to route it: {listed}",
+        thread_name=thread,
+    )
+    if "error" in note:
+        log(f"could not post not-delivered note: {note['error']}")
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     data = read_registry()
     if args.json:
@@ -627,8 +720,6 @@ def main() -> int:
     s.add_argument("--session", required=True, help="stable session id; owns one Chat thread")
     s.add_argument("--pane", help="target pane id (default: $HERDR_PANE_ID)")
     s.add_argument("--name", help="rename the Herdr agent to this (default: session id)")
-    s.add_argument("--reuse-thread", action="store_true",
-                   help="reply into the recorded thread name instead of the session thread key")
     s.add_argument("--no-label", action="store_true",
                    help="omit the [session · repo] prefix")
     s.set_defaults(func=cmd_send)

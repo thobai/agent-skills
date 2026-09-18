@@ -52,10 +52,14 @@ tail -f ~/.local/state/chat-router/router.log
 - **Whitespace is collapsed** in injected text: a newline in a prompt submits it
   early and would fragment the reply.
 - **Unmatched threads.** A message in a thread no session owns — a retired
-  session's thread, or a brand new message — is not delivered. The router replies
-  in that thread naming the live sessions. Guessing the target sends a message to
-  the wrong agent, which is worse than not delivering it. `--fallback last`
-  restores the old guessing behaviour.
+  session's thread, or a brand new message — is held, not delivered. The router
+  replies asking who it is for and lists the five most recently active sessions.
+  Answer with a name (`orchestrator`, or an unambiguous abbreviation like
+  `orch`) and it binds that thread to that session, forwards everything it held,
+  and confirms. Anything you wrote alongside the name is forwarded too. From
+  then on the session sends and receives in that thread. An ambiguous or unknown
+  name is asked again rather than guessed, and `--fallback last` restores the old
+  guess-the-most-recent behaviour.
 - **Markdown** is sent with `markupSyntax: MARKUP_SYNTAX_MARKDOWN`. Tables are
   wrapped in a code fence first, because Chat concatenates their cells and eats
   the following line; `---` rules are stripped, because Chat discards them.
