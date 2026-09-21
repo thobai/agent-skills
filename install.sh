@@ -10,6 +10,15 @@ for skill in */bin/*; do
   echo "  ✓ $(basename "$skill") → ~/.local/bin/$(basename "$skill")"
 done
 
+# Symlink SKILL.md files into ~/.kiro/skills/ so repo edits apply immediately
+KIRO_SKILLS="$HOME/.kiro/skills"
+for skill in */SKILL.md; do
+  name="$(dirname "$skill")"
+  mkdir -p "$KIRO_SKILLS/$name"
+  ln -sf "$(pwd)/$skill" "$KIRO_SKILLS/$name/SKILL.md"
+  echo "  ✓ $name/SKILL.md → $KIRO_SKILLS/$name/SKILL.md"
+done
+
 # Create config file if it doesn't exist
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-skills"
 CONFIG_FILE="$CONFIG_DIR/env"

@@ -147,9 +147,16 @@ def read_registry() -> dict:
 # ------------------------------------------------------------------------ gws
 
 
-def gws_json(args: list[str]) -> dict:
-    """Run gws and parse its JSON, skipping the keyring preamble."""
-    p = subprocess.run(["gws", *args], capture_output=True, text=True)
+def gws_json(args: list[str], timeout: int = 20) -> dict:
+    """Run gws and parse its JSON, skipping the keyring preamble.
+
+    A poll that hangs would stall the whole loop, so it is bounded: when a
+    proxy blackholes the connection, gws can sit for 90 seconds.
+    """
+    try:
+        p = subprocess.run(["gws", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": {"message": f"gws timed out after {timeout}s"}}
     lines = p.stdout.splitlines()
     start = next((i for i, ln in enumerate(lines) if ln[:1] in "{["), None)
     if start is None:
@@ -400,11 +407,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
     require("NOTIFY_ME_WEBHOOK_URL")
     log(f"router start space={space} interval={args.interval}s fallback={args.fallback}")
 
+    fails = 0
     while True:
         msgs, err = fetch_recent(space, args.page_size)
         if err:
-            log(f"poll error: {err}")
+            fails += 1
+            log(f"poll error ({fails}/{args.max_errors}): {err}")
+            # gws appears to cache the system trust store at startup, so a
+            # long-lived process keeps failing with UnknownIssuer after a
+            # proxy's CA changes while a fresh process succeeds. Exiting lets
+            # the supervisor restart us with a current trust store.
+            if fails >= args.max_errors:
+                log("too many consecutive poll failures - exiting for a fresh start")
+                return 1
         else:
+            fails = 0
             process(list(reversed(msgs)), args)  # oldest-first
         if args.once:
             return 0
@@ -586,8 +603,11 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     else:
         if not sh("command -v tmux").stdout.strip():
             die("tmux not found")
+        # Mirror launchd's KeepAlive: the watcher exits on repeated poll
+        # failures so it can come back with a fresh trust store.
         sh(f"tmux new-session -d -s {TMUX_SESSION} "
-           f"'export PATH=\"{daemon_path()}\"; {self_path()} watch --interval {args.interval}'")
+           f"'export PATH=\"{daemon_path()}\"; "
+           f"while true; do {self_path()} watch --interval {args.interval}; sleep 5; done'")
         time.sleep(2)
         if not tmux_running():
             die("tmux session did not start")
@@ -728,6 +748,9 @@ def main() -> int:
     w.add_argument("--interval", type=int, default=5)
     w.add_argument("--page-size", type=int, default=25)
     w.add_argument("--once", action="store_true")
+    w.add_argument("--max-errors", type=int, default=5,
+                   help="exit after this many consecutive poll failures so the "
+                        "supervisor restarts the process")
     w.add_argument("--fallback", choices=["last", "none"], default="none",
                    help="'last' routes a message from an unknown thread to the most "
                         "recently active session; the default refuses and says so in Chat")
