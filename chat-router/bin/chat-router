@@ -745,7 +745,7 @@ def main() -> int:
     s.set_defaults(func=cmd_send)
 
     w = sub.add_parser("watch", help="run the router daemon")
-    w.add_argument("--interval", type=int, default=5)
+    w.add_argument("--interval", type=int, default=2)
     w.add_argument("--page-size", type=int, default=25)
     w.add_argument("--once", action="store_true")
     w.add_argument("--max-errors", type=int, default=5,
@@ -764,7 +764,7 @@ def main() -> int:
                    help="supervise with launchd (macOS, survives reboot)")
     d.add_argument("--tmux", dest="flavour", action="store_const", const="tmux",
                    help="supervise with a detached tmux session")
-    d.add_argument("--interval", type=int, default=5)
+    d.add_argument("--interval", type=int, default=2)
     d.add_argument("--force", action="store_true",
                    help="reinstall even if that flavour is already running")
     d.add_argument("--keep-plist", action="store_true", help="uninstall without deleting the plist")
